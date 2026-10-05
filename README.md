@@ -43,6 +43,19 @@ A compiled template is reusable. Each render validates every variable on the sel
 
 A missing variable, wrong type, or invalid URL throws before any partial HTML is returned.
 
+## Structured data blocks (`allowJsonData: true`)
+
+With `allowJsonData: true`, a literal `<script type="application/json">` start tag opens a data block instead of a raw script region.
+
+- A block contains exactly **one complete JSON value** interpolation plus optional surrounding whitespace. The value may be produced directly, by an `{{#include}}`, or by an `{{#if}}`, but every if/else branch must finish in the same state: a branch that emits the value while the other emits only whitespace is a compile error, and two values in one block (even across separate `if`s) never compile. Interpolation inside a JSON fragment such as `{"a": {{x}}}` or `[1,{{x}}]` is rejected.
+- The `type` is an exact, case-insensitive literal (surrounding whitespace trimmed; parameters such as `; charset=` are not a data block). It cannot be interpolated, chosen by a branch, repeated (including a second boolean `type`), or supplied through an include. Ordinary `<script>` and `<style>` regions continue to reject all dynamic content, including other attributes on a `<script>` start tag. When the option is off, every `<script>` is an ordinary raw region.
+- The same include file is compiled against each call site, so it is handled as a JSON value inside a data block and as escaped text/attribute/URL output elsewhere; the contexts never share output classification.
+- Accepted data: finite numbers, strings, booleans, `null`, dense arrays without extra properties, and plain objects. Rejected: `NaN`/`Infinity`, circular references, accessor (getter/setter) properties, non-enumerable and symbol-keyed properties, array holes and extra array properties, own `toJSON`, non-plain objects such as `Date`/`Map`/class instances, `bigint`, `undefined`, functions, and symbols, plus nesting deeper than 16 object/array levels. Getters are never invoked, so bad values are refused without side effects.
+- Serialization preserves type and value: the text is inserted raw (never HTML-entity escaped), and `<`, `>`, U+2028 and U+2029 are emitted as unicode escapes so data containing `</script>` or script comment sequences cannot change the page structure.
+- Render is atomic: every value on the selected branch is validated before output is built, so invalid data never yields a successful half page.
+
+After rendering, `JSON.parse(script.textContent)` returns a value deeply equal to the input.
+
 ## Example
 
 ```js

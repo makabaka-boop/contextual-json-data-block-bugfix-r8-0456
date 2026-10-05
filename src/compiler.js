@@ -1,4 +1,4 @@
-import { serializeJsonData } from "./json-data.js";
+import { serializeJsonData, JsonDataError } from "./json-data.js";
 import { fail, TemplateError } from "./errors.js";
 import { parseTemplate } from "./template-parser.js";
 import { createScanner } from "./html-scanner.js";
@@ -141,6 +141,8 @@ function compileNodes(nodes, scanner, graph, chain, program) {
       program.push({ type: "literal", value: node.text });
     } else if (node.type === "output") {
       const context = scanner.output(node.loc);
+      // Copy rather than alias: a partial's AST is shared across call sites,
+      // and each surrounding HTML context assigns its own kind.
       program.push({
         type: "output",
         kind: context.kind,
@@ -212,7 +214,15 @@ function compileInclude(node, scanner, graph, chain, program) {
   } catch (error) {
     throw withChain(error, nextChain, node.loc);
   }
+  try {
+    scanner.includeBoundary(node.loc);
+  } catch (error) {
+    throw withChain(error, nextChain, node.loc);
+  }
   const includedProgram = [];
+  // Compile this call site from the (cached) AST rather than reusing another
+  // site's program: the same partial in a JSON block, text node, and quoted
+  // attribute must each produce output governed by its own HTML context.
   try {
     compileNodes(ast.nodes, scanner, graph, nextChain, includedProgram);
   } catch (error) {
@@ -285,6 +295,22 @@ function requireSafeUrl(value, baseUrl, loc) {
   }
 }
 
+function requireValidJson(value, loc) {
+  try {
+    return serializeJsonData(value);
+  } catch (error) {
+    if (error instanceof JsonDataError) {
+      fail(error.message, {
+        code: "INVALID_JSON_DATA",
+        file: loc?.file,
+        position: loc,
+        cause: error,
+      });
+    }
+    throw error;
+  }
+}
+
 function lookup(path, data, loc, allowMissing = false) {
   let current = data;
   for (const key of path) {
@@ -312,7 +338,7 @@ function validateProgram(nodes, data, baseUrl) {
       const result = lookup(node.path, data, node.loc);
       const value = result.value;
       if (node.kind === "json") {
-        serializeJsonData(value);
+        requireValidJson(value, node.loc);
         continue;
       }
       if (typeof value !== "string") {
@@ -380,7 +406,7 @@ function renderProgram(nodes, data, baseUrl) {
       output += node.value;
     } else if (node.type === "output") {
       const { value } = lookup(node.path, data, node.loc);
-      if (node.kind === "json") output += serializeJsonData(value);
+      if (node.kind === "json") output += requireValidJson(value, node.loc);
       else if (node.kind === "text") output += escapeHtmlText(value);
       else if (node.kind === "url")
         output += escapeHtmlAttribute(requireSafeUrl(value, baseUrl, node.loc));

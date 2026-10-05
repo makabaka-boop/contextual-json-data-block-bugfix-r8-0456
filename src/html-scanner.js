@@ -54,9 +54,10 @@ function initialState() {
     hasUrlOutput: false,
     scriptType: "",
     scriptTypeSeen: false,
+    scriptTypeCount: 0,
     attrValue: "",
     jsonBlock: false,
-    jsonEmitted: false,
+    jsonValueCount: 0,
     rawType: "",
     rawEndName: "",
     declaration: "",
@@ -83,6 +84,20 @@ function isNameChar(char) {
   return /[A-Za-z0-9_:.-]/.test(char);
 }
 
+function isScriptTagAttributeMode(mode) {
+  return (
+    mode === MODE.BEFORE_ATTR ||
+    mode === MODE.ATTR_NAME ||
+    mode === MODE.AFTER_ATTR_NAME ||
+    mode === MODE.BEFORE_ATTR_VALUE ||
+    mode === MODE.ATTR_VALUE_DOUBLE ||
+    mode === MODE.ATTR_VALUE_SINGLE ||
+    mode === MODE.ATTR_VALUE_UNQUOTED ||
+    mode === MODE.AFTER_ATTR_VALUE ||
+    mode === MODE.SELF_CLOSING_START
+  );
+}
+
 function policyFor(name) {
   const lower = name.toLowerCase();
   if (lower.startsWith("on")) return "event";
@@ -100,6 +115,16 @@ function mergePolicy(a, b) {
 }
 
 function statesCompatible(a, b) {
+  // Script-shaping state is selected by the literal `<script ...>` tag; every
+  // branch must agree on it so neither the script type nor the JSON/raw
+  // character of a block can be chosen (or repeated) dynamically.
+  if (
+    a.jsonBlock !== b.jsonBlock ||
+    a.scriptType !== b.scriptType ||
+    a.scriptTypeSeen !== b.scriptTypeSeen ||
+    a.scriptTypeCount !== b.scriptTypeCount
+  )
+    return false;
   if (a.mode !== b.mode) return false;
   switch (a.mode) {
     case MODE.TAG_NAME:
@@ -122,6 +147,7 @@ function statesCompatible(a, b) {
       return (
         a.tagName === b.tagName &&
         a.attrName === b.attrName &&
+        a.attrValue === b.attrValue &&
         a.rawType === b.rawType
       );
     case MODE.ATTR_VALUE_DOUBLE:
@@ -132,11 +158,12 @@ function statesCompatible(a, b) {
         a.attrName === b.attrName &&
         a.attrPolicy === b.attrPolicy &&
         a.rawType === b.rawType &&
+        a.attrValue === b.attrValue &&
         a.hasAttrLiteral === b.hasAttrLiteral &&
         a.hasUrlOutput === b.hasUrlOutput
       );
     case MODE.RAW:
-      return a.rawType === b.rawType;
+      return a.rawType === b.rawType && a.jsonValueCount === b.jsonValueCount;
     case MODE.RAW_LT:
       return a.rawType === b.rawType;
     case MODE.RAW_END_NAME:
@@ -524,6 +551,9 @@ class HtmlScanner {
 
   startAttribute(char) {
     const s = this.state;
+    // A boolean attribute directly followed by another name never passed
+    // through a value state; finalize it first.
+    this.clearAttribute();
     s.attrValue = "";
     s.mode = MODE.ATTR_NAME;
     s.attrName = char;
@@ -539,14 +569,15 @@ class HtmlScanner {
       s.rawType === "script" &&
       s.attrName.toLowerCase() === "type"
     ) {
-      if (s.scriptTypeSeen)
+      s.scriptTypeCount += 1;
+      if (s.scriptTypeCount > 1)
         this.failAt(
-          "duplicate script type",
+          "duplicate script type attribute",
           "JSON_SCRIPT_TYPE",
           s.lastLoc ?? {},
         );
       s.scriptTypeSeen = true;
-      s.scriptType = s.attrValue.toLowerCase();
+      s.scriptType = s.attrValue.trim().toLowerCase();
     }
     s.attrValue = "";
     s.attrName = "";
@@ -579,19 +610,47 @@ class HtmlScanner {
     }
   }
 
+  includeBoundary(loc) {
+    const s = this.state;
+    s.lastLoc = loc;
+    if (
+      s.rawType === "script" &&
+      isScriptTagAttributeMode(s.mode) &&
+      s.attrName.toLowerCase() === "type"
+    )
+      this.failAt(
+        "script type attribute must be a literal in the enclosing template; it cannot be supplied through an include",
+        "JSON_SCRIPT_TYPE",
+        loc,
+      );
+  }
+
   output(loc) {
     const s = this.state;
     s.lastLoc = loc;
     if (s.mode === MODE.RAW && s.jsonBlock) {
-      s.jsonEmitted = true;
+      s.jsonValueCount += 1;
+      if (s.jsonValueCount > 1)
+        this.failAt(
+          "JSON block must contain exactly one whole JSON value",
+          "JSON_BLOCK_CONTENT",
+          loc,
+        );
       return { kind: "json" };
     }
-    if (
-      this.allowJsonData &&
-      s.rawType === "script" &&
-      s.attrName.toLowerCase() === "type"
-    )
-      this.failAt("script type must be literal", "JSON_SCRIPT_TYPE", loc);
+    if (s.rawType === "script" && isScriptTagAttributeMode(s.mode)) {
+      if (s.attrName.toLowerCase() === "type")
+        this.failAt(
+          "script type attribute must be a static literal",
+          "JSON_SCRIPT_TYPE",
+          loc,
+        );
+      this.failAt(
+        "script start tag attributes cannot contain interpolation",
+        "DYNAMIC_RAW_ELEMENT",
+        loc,
+      );
+    }
     switch (s.mode) {
       case MODE.DATA:
         return { kind: "text" };
@@ -704,9 +763,14 @@ class HtmlScanner {
       this.allowJsonData &&
       rawType === "script" &&
       s.scriptType === "application/json";
-    s.jsonEmitted = false;
+    s.jsonValueCount = 0;
     s.mode = rawType && !selfClosing ? MODE.RAW : MODE.DATA;
-    if (selfClosing) s.rawType = "";
+    if (selfClosing) {
+      s.rawType = "";
+      s.scriptType = "";
+      s.scriptTypeSeen = false;
+      s.scriptTypeCount = 0;
+    }
   }
 
   closeEndTag(loc) {
@@ -714,9 +778,11 @@ class HtmlScanner {
   }
 
   closeRawEnd(loc) {
-    if (this.state.jsonBlock && !this.state.jsonEmitted)
+    if (this.state.jsonBlock && this.state.jsonValueCount !== 1)
       this.failAt(
-        "JSON block needs one whole value",
+        this.state.jsonValueCount === 0
+          ? "JSON block must contain one whole JSON value"
+          : "JSON block must contain exactly one whole JSON value",
         "JSON_BLOCK_CONTENT",
         loc,
       );
