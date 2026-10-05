@@ -99,6 +99,19 @@ function mergePolicy(a, b) {
   return null;
 }
 
+function sameTagShape(a, b) {
+  return (
+    a.tagName === b.tagName &&
+    a.attrName === b.attrName &&
+    a.attrPolicy === b.attrPolicy &&
+    a.hasAttrLiteral === b.hasAttrLiteral &&
+    a.hasUrlOutput === b.hasUrlOutput &&
+    a.rawType === b.rawType &&
+    a.scriptTypeSeen === b.scriptTypeSeen &&
+    a.scriptType === b.scriptType
+  );
+}
+
 function statesCompatible(a, b) {
   if (a.mode !== b.mode) return false;
   switch (a.mode) {
@@ -110,38 +123,26 @@ function statesCompatible(a, b) {
     case MODE.BEFORE_ATTR_VALUE:
     case MODE.AFTER_ATTR_VALUE:
     case MODE.SELF_CLOSING_START:
-      return (
-        a.tagName === b.tagName &&
-        a.attrName === b.attrName &&
-        a.attrPolicy === b.attrPolicy &&
-        a.hasAttrLiteral === b.hasAttrLiteral &&
-        a.hasUrlOutput === b.hasUrlOutput &&
-        a.rawType === b.rawType
-      );
+      return sameTagShape(a, b);
     case MODE.ATTR_NAME:
-      return (
-        a.tagName === b.tagName &&
-        a.attrName === b.attrName &&
-        a.rawType === b.rawType
-      );
+      return sameTagShape(a, b);
     case MODE.ATTR_VALUE_DOUBLE:
     case MODE.ATTR_VALUE_SINGLE:
     case MODE.ATTR_VALUE_UNQUOTED:
-      return (
-        a.tagName === b.tagName &&
-        a.attrName === b.attrName &&
-        a.attrPolicy === b.attrPolicy &&
-        a.rawType === b.rawType &&
-        a.hasAttrLiteral === b.hasAttrLiteral &&
-        a.hasUrlOutput === b.hasUrlOutput
-      );
+      return sameTagShape(a, b);
     case MODE.RAW:
-      return a.rawType === b.rawType;
     case MODE.RAW_LT:
-      return a.rawType === b.rawType;
     case MODE.RAW_END_NAME:
     case MODE.RAW_END_TAG:
-      return a.rawType === b.rawType && a.rawEndName === b.rawEndName;
+      return (
+        a.rawType === b.rawType &&
+        a.jsonBlock === b.jsonBlock &&
+        a.jsonEmitted === b.jsonEmitted &&
+        (a.mode === MODE.RAW_END_NAME ||
+        a.mode === MODE.RAW_END_TAG
+          ? a.rawEndName === b.rawEndName
+          : true)
+      );
     case MODE.COMMENT:
     case MODE.COMMENT_DASH:
     case MODE.COMMENT_BANG_DASH:
@@ -524,6 +525,10 @@ class HtmlScanner {
 
   startAttribute(char) {
     const s = this.state;
+    // Flush the previous attribute, if any, before its name is overwritten.
+    // Otherwise a valueless attribute followed by another attribute would skip
+    // the duplicate script-type check.
+    this.clearAttribute();
     s.attrValue = "";
     s.mode = MODE.ATTR_NAME;
     s.attrName = char;
@@ -560,13 +565,18 @@ class HtmlScanner {
   }
 
   attributeLiteral(char, loc) {
+    const s = this.state;
+    // Track the script type as it is read so branches that diverge inside a
+    // type attribute value cannot silently downgrade an application/json
+    // block into an ordinary (dynamics-forbidden) script after merging.
     if (
       this.allowJsonData &&
-      this.state.rawType === "script" &&
-      this.state.attrName.toLowerCase() === "type"
-    )
-      this.state.attrValue += char;
-    const s = this.state;
+      s.rawType === "script" &&
+      s.attrName.toLowerCase() === "type"
+    ) {
+      s.attrValue += char;
+      s.scriptType = s.attrValue.toLowerCase();
+    }
     if (s.attrPolicy === "url") {
       if (s.hasUrlOutput) {
         this.failAt(
@@ -583,6 +593,12 @@ class HtmlScanner {
     const s = this.state;
     s.lastLoc = loc;
     if (s.mode === MODE.RAW && s.jsonBlock) {
+      if (s.jsonEmitted)
+        this.failAt(
+          "JSON block must contain exactly one whole-value interpolation",
+          "JSON_BLOCK_CONTENT",
+          loc,
+        );
       s.jsonEmitted = true;
       return { kind: "json" };
     }

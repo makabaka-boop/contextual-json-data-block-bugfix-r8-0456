@@ -305,6 +305,22 @@ function lookup(path, data, loc, allowMissing = false) {
   return { value: current };
 }
 
+function requireJsonValue(value, loc) {
+  try {
+    return serializeJsonData(value);
+  } catch (error) {
+    if (error instanceof TemplateError) {
+      fail(error.message, {
+        code: "INVALID_JSON_DATA",
+        file: loc?.file,
+        position: loc,
+        cause: error,
+      });
+    }
+    throw error;
+  }
+}
+
 function validateProgram(nodes, data, baseUrl) {
   for (const node of nodes) {
     if (node.type === "literal") continue;
@@ -312,7 +328,7 @@ function validateProgram(nodes, data, baseUrl) {
       const result = lookup(node.path, data, node.loc);
       const value = result.value;
       if (node.kind === "json") {
-        serializeJsonData(value);
+        requireJsonValue(value, node.loc);
         continue;
       }
       if (typeof value !== "string") {
@@ -380,7 +396,7 @@ function renderProgram(nodes, data, baseUrl) {
       output += node.value;
     } else if (node.type === "output") {
       const { value } = lookup(node.path, data, node.loc);
-      if (node.kind === "json") output += serializeJsonData(value);
+      if (node.kind === "json") output += requireJsonValue(value, node.loc);
       else if (node.kind === "text") output += escapeHtmlText(value);
       else if (node.kind === "url")
         output += escapeHtmlAttribute(requireSafeUrl(value, baseUrl, node.loc));

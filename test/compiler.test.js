@@ -462,3 +462,475 @@ test("parse5 checks URL payloads do not introduce attributes or elements", () =>
   assert.equal(a.attrs[0].name, "href");
   assert.match(a.attrs[0].value, /^\/path\?x=%22/);
 });
+
+const parseDocument = (html) => parse5.parse(html);
+
+const findNode = (node, predicate) => {
+  if (predicate(node)) return node;
+  for (const child of node.childNodes ?? []) {
+    const found = findNode(child, predicate);
+    if (found) return found;
+  }
+  return null;
+};
+
+const parseBody = (html) =>
+  findNode(parseDocument(html), (node) => node.nodeName === "body");
+
+const textContent = (node) =>
+  (node.childNodes ?? [])
+    .map((child) =>
+      child.nodeName === "#text" ? child.value : textContent(child),
+    )
+    .join("");
+
+const collectTags = (node, tags = []) => {
+  if (node.nodeName && !node.nodeName.startsWith("#")) tags.push(node.nodeName);
+  for (const child of node.childNodes ?? []) collectTags(child, tags);
+  return tags;
+};
+
+const findById = (root, id) =>
+  findNode(root, (node) =>
+    node.attrs?.some((attr) => attr.name === "id" && attr.value === id),
+  );
+
+const scriptById = (html, id) => findById(parseDocument(html), id);
+
+const jsonBlock = '<script id="data" type="application/json">{{payload}}</script>';
+
+test("JSON blocks round-trip every supported value with its type intact", () => {
+  const compiled = compile(
+    { "index.html": jsonBlock },
+    "index.html",
+    { allowJsonData: true },
+  );
+  const payloads = [
+    { string: "text", nested: { a: [1, 2, 3], b: null, c: true, d: 1.5 } },
+    ["a", 1, -2.5, true, false, null, {}, []],
+    0,
+    "",
+    true,
+    false,
+    null,
+    { "": [{ "key.with.dots": 9007199254740993 }] },
+  ];
+  for (const payload of payloads) {
+    const script = scriptById(compiled.render({ payload }), "data");
+    assert.equal(script.nodeName, "script");
+    assert.deepEqual(JSON.parse(textContent(script)), payload);
+  }
+  // negative zero follows JSON.stringify semantics (the same fidelity a
+  // JSON-based transport provides): it serializes as the number 0
+  const negativeZeroScript = scriptById(
+    compiled.render({ payload: { zero: -0 } }),
+    "data",
+  );
+  assert.equal(
+    textContent(negativeZeroScript),
+    JSON.stringify({ zero: -0 }),
+  );
+});
+
+test("parse5: HTML closing tags inside JSON strings cannot change page structure", () => {
+  const compiled = compile(
+    {
+      "index.html":
+        jsonBlock +
+        '<p id="after">after</p><script type="text/javascript">var a = 1;</script>',
+    },
+    "index.html",
+    { allowJsonData: true },
+  );
+  const payload = {
+    close: '</script><img src=x onerror="alert(1)">',
+    nested: [{ raw: "</script\t" }, { close: "</script >" }, "</style>"],
+    lt: "<<<",
+  };
+  const html = compiled.render({ payload });
+  const document = parseDocument(html);
+  const script = findById(document, "data");
+  assert.deepEqual(JSON.parse(textContent(script)), payload);
+  assert.ok(findById(document, "after"));
+  assert.deepEqual(
+    collectTags(document).filter(
+      (name) => name === "img" || name === "svg" || name === "style",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    collectTags(document).filter((name) => name === "script"),
+    ["script", "script"],
+  );
+});
+
+test("JSON block literal content is limited to whitespace around one value", () => {
+  const ok = compile(
+    {
+      "index.html":
+        '<script type="application/json">\n\t {{payload}}  \r\n</script>',
+    },
+    "index.html",
+    { allowJsonData: true },
+  );
+  assert.deepEqual(JSON.parse(ok.render({ payload: { a: 1 } }).match(/>([\s\S]*?)<\/script>/)[1].trim()), {
+    a: 1,
+  });
+
+  for (const source of [
+    '<script type="application/json">{"literal":true}</script>',
+    '<script type="application/json">{{a}} {{b}}</script>',
+    '<script type="application/json">{{a}}junk</script>',
+    '<script type="application/json">x{{a}}</script>',
+    '<script type="application/json">{"a":{{a}}}</script>',
+    '<script type="application/json"></script>',
+    '<script type="application/json">  </script>',
+  ]) {
+    rejectCode(
+      () =>
+        compile(
+          { "index.html": source },
+          "index.html",
+          { allowJsonData: true },
+        ),
+      "JSON_BLOCK_CONTENT",
+    );
+  }
+});
+
+test("all if/else branches inside a JSON block must emit one complete value", () => {
+  const compiled = compile(
+    {
+      "index.html":
+        '<script type="application/json">{{#if pick}}{{a}}{{else}}{{b}}{{/if}}</script>',
+    },
+    "index.html",
+    { allowJsonData: true },
+  );
+  const jsonOf = (html) =>
+    JSON.parse(
+      findNode(
+        parseDocument(html),
+        (node) => node.nodeName === "script",
+      )
+        .childNodes.map((child) => child.value)
+        .join(""),
+    );
+  assert.deepEqual(jsonOf(compiled.render({ pick: true, a: { x: 1 }, b: null })), {
+    x: 1,
+  });
+  assert.deepEqual(jsonOf(compiled.render({ pick: false, a: { x: 1 }, b: [1, 2] })), [
+    1,
+    2,
+  ]);
+
+  rejectCode(
+    () =>
+      compile(
+        {
+          "index.html":
+            '<script type="application/json">{{#if pick}}{{a}}{{else}} {{/if}}</script>',
+        },
+        "index.html",
+        { allowJsonData: true },
+      ),
+    "INCOMPATIBLE_BRANCH_CONTEXT",
+  );
+  rejectCode(
+    () =>
+      compile(
+        {
+          "index.html":
+            '<script type="application/json">{{#if pick}}{{a}}{{b}}{{else}}{{c}}{{/if}}</script>',
+        },
+        "index.html",
+        { allowJsonData: true },
+      ),
+    "JSON_BLOCK_CONTENT",
+  );
+  rejectCode(
+    () =>
+      compile(
+        {
+          "index.html":
+            '{{#if pick}}<script type="application/json">{{a}}</script>{{else}}<script type="application/json"> {{/if}}',
+        },
+        "index.html",
+        { allowJsonData: true },
+      ),
+    "INCOMPATIBLE_BRANCH_CONTEXT",
+  );
+});
+
+test("includes participate in JSON block compatibility, including across files", () => {
+  const good = compile(
+    {
+      "index.html":
+        '<script type="application/json">{{#include "data.html"}}</script>',
+      "data.html": "{{payload}}",
+    },
+    "index.html",
+    { allowJsonData: true },
+  );
+  const html = good.render({ payload: { fromInclude: true } });
+  const script = findNode(
+    parseDocument(html),
+    (node) => node.nodeName === "script",
+  );
+  assert.deepEqual(JSON.parse(textContent(script)), {
+    fromInclude: true,
+  });
+
+  rejectCode(
+    () =>
+      compile(
+        {
+          "index.html":
+            '<script type="application/json">{{#include "data.html"}}</script>',
+          "data.html": "{{#if pick}}{{a}}{{else}} {{/if}}",
+        },
+        "index.html",
+        { allowJsonData: true },
+      ),
+    "INCOMPATIBLE_BRANCH_CONTEXT",
+  );
+  rejectCode(
+    () =>
+      compile(
+        {
+          "index.html":
+            '<script type="application/json">{{#include "data.html"}}</script>',
+          "data.html": "{{a}} {{b}}",
+        },
+        "index.html",
+        { allowJsonData: true },
+      ),
+    "JSON_BLOCK_CONTENT",
+  );
+});
+
+test("the same partial is handled by text and JSON-block conventions in one page", () => {
+  const compiled = compile(
+    {
+      "index.html":
+        '<p id="text">{{#include "value.html"}}</p><script id="data" type="application/json">{{#include "value.html"}}</script>',
+      "value.html": "{{shared}}",
+    },
+    "index.html",
+    { allowJsonData: true },
+  );
+  const html = compiled.render({
+    shared: "</p><script>alert(1)</script>",
+  });
+  const document = parseDocument(html);
+  const p = findById(document, "text");
+  const script = findById(document, "data");
+  assert.equal(p.childNodes[0].value, "</p><script>alert(1)</script>");
+  assert.deepEqual(
+    JSON.parse(textContent(script)),
+    "</p><script>alert(1)</script>",
+  );
+  assert.deepEqual(collectTags(document).sort(), [
+    "body",
+    "head",
+    "html",
+    "p",
+    "script",
+  ]);
+  assert.deepEqual(
+    collectTags(document).filter((name) => name === "img"),
+    [],
+  );
+});
+
+test("script type cannot be dynamic, duplicated, or silently downgraded across branches", () => {
+  for (const source of [
+    '<script type="{{t}}">{{x}}</script>',
+    '<script type={{t}}>{{x}}</script>',
+    '<script tYpE="{{t}}">{{x}}</script>',
+    '<script type="application/json" type="text/javascript">{{x}}</script>',
+    '<script type type="application/json">{{x}}</script>',
+  ]) {
+    rejectCode(
+      () =>
+        compile(
+          { "index.html": source },
+          "index.html",
+          { allowJsonData: true },
+        ),
+      "JSON_SCRIPT_TYPE",
+    );
+  }
+
+  // divergent presence of the type attribute
+  rejectCode(
+    () =>
+      compile(
+        {
+          "index.html":
+            '<script {{#if p}}type="application/json"{{else}}data-x="y"{{/if}}>{{x}}</script>',
+        },
+        "index.html",
+        { allowJsonData: true },
+      ),
+    "INCOMPATIBLE_BRANCH_CONTEXT",
+  );
+  // divergent literal value of the same type attribute
+  rejectCode(
+    () =>
+      compile(
+        {
+          "index.html":
+            '<script type="application/{{#if p}}json{{else}}x{{/if}}">{{x}}</script>',
+        },
+        "index.html",
+        { allowJsonData: true },
+      ),
+    "INCOMPATIBLE_BRANCH_CONTEXT",
+  );
+});
+
+test("ordinary script and style regions keep rejecting dynamic content with the feature enabled", () => {
+  for (const source of [
+    "<script>{{x}}</script>",
+    '<script type="text/javascript">{{x}}</script>',
+    "<style>{{x}}</style>",
+  ]) {
+    rejectCode(
+      () =>
+        compile(
+          { "index.html": source },
+          "index.html",
+          { allowJsonData: true },
+        ),
+      "DYNAMIC_RAW_ELEMENT",
+    );
+  }
+  rejectCode(
+    () =>
+      compile(
+        { "index.html": '<script type="application/json">{{x}}</script>' },
+        "index.html",
+      ),
+    "DYNAMIC_RAW_ELEMENT",
+  );
+});
+
+test("non-finite numbers and non-JSON values fail with INVALID_JSON_DATA before output", () => {
+  const compiled = compile(
+    { "index.html": "<pre>{{head}}</pre>" + jsonBlock },
+    "index.html",
+    { allowJsonData: true },
+  );
+  const assertInvalid = (payload) => {
+    let threw = null;
+    try {
+      compiled.render({ head: "visible", payload });
+    } catch (error) {
+      threw = error;
+    }
+    assert.ok(threw instanceof TemplateError, "expected TemplateError");
+    assert.equal(threw.code, "INVALID_JSON_DATA");
+    assert.equal(threw.file, "index.html");
+  };
+  for (const payload of [
+    NaN,
+    Infinity,
+    -Infinity,
+    1e999,
+    undefined,
+    1n,
+    () => 1,
+    Symbol("x"),
+    { v: NaN },
+    { v: undefined },
+    { v: 1n },
+    { v: () => 1 },
+    { v: Symbol() },
+    { get v() { return 1; } },
+    { set v(_) {} },
+    new Date(),
+    Object.create({ v: 1 }),
+    { toJSON() { return {}; } },
+  ])
+    assertInvalid(payload);
+
+  const sparse = [1, 2];
+  delete sparse[0];
+  assertInvalid(sparse);
+  assertInvalid(Object.assign([1], { extra: 2 }));
+  assertInvalid([{ get v() { return 1; } }]);
+  assertInvalid({ [Symbol("x")]: 1 });
+
+  const circular = {};
+  circular.self = circular;
+  assertInvalid(circular);
+  const cyclicArray = [1];
+  cyclicArray.push(cyclicArray);
+  assertInvalid(cyclicArray);
+});
+
+test("JSON nesting deeper than 16 levels is rejected", () => {
+  const compiled = compile(
+    { "index.html": jsonBlock },
+    "index.html",
+    { allowJsonData: true },
+  );
+  const nestObjects = (depth) =>
+    depth === 0 ? 1 : { a: nestObjects(depth - 1) };
+  const nestArrays = (depth) => (depth === 0 ? 1 : [nestArrays(depth - 1)]);
+  assert.doesNotThrow(() =>
+    JSON.parse(compiled.render({ payload: nestObjects(16) }).match(/>([\s\S]*?)<\/script>/)[1]),
+  );
+  assert.doesNotThrow(() =>
+    JSON.parse(compiled.render({ payload: nestArrays(16) }).match(/>([\s\S]*?)<\/script>/)[1]),
+  );
+  rejectCode(
+    () => compiled.render({ payload: nestObjects(17) }),
+    "INVALID_JSON_DATA",
+  );
+  rejectCode(
+    () => compiled.render({ payload: nestArrays(17) }),
+    "INVALID_JSON_DATA",
+  );
+});
+
+test("invalid JSON data makes rendering atomic even after earlier page content", () => {
+  const compiled = compile(
+    {
+      "index.html":
+        "<header>{{title}}</header>" +
+        jsonBlock +
+        "<footer>{{foot}}</footer>",
+    },
+    "index.html",
+    { allowJsonData: true },
+  );
+  assert.throws(
+    () =>
+      compiled.render({
+        title: "would be output",
+        foot: "also output",
+        payload: { bad: NaN },
+      }),
+    (error) => error.code === "INVALID_JSON_DATA",
+  );
+});
+
+test("only the selected conditional branch needs valid JSON data", () => {
+  const compiled = compile(
+    {
+      "index.html":
+        '<script type="application/json">{{#if pick}}{{a}}{{else}}{{b}}{{/if}}</script>',
+    },
+    "index.html",
+    { allowJsonData: true },
+  );
+  const html = compiled.render({ pick: false, a: NaN, b: { ok: true } });
+  const script = findNode(
+    parseDocument(html),
+    (node) => node.nodeName === "script",
+  );
+  assert.deepEqual(JSON.parse(textContent(script)), { ok: true });
+});
+
